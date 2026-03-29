@@ -30,12 +30,118 @@ red_log() {
 #################################################
 
 # Download Github assets requirement:
+get_revanced_gitlab_tag() {
+    local requested_tag="$1"
+    local release_json
+
+    release_json=$(wget -qO- "https://gitlab.com/api/v4/projects/revanced%2Frevanced-patches/releases") || return 1
+
+    if [[ "$requested_tag" == "prerelease" ]]; then
+        printf '%s' "$release_json" | jq -r 'map(select(.tag_name | contains("-dev."))) | .[0].tag_name // empty'
+    elif [[ "$requested_tag" == "latest" ]]; then
+        printf '%s' "$release_json" | jq -r 'map(select((.tag_name | contains("-dev.")) | not)) | .[0].tag_name // empty'
+    else
+        printf '%s\n' "$requested_tag"
+    fi
+}
+
+build_revanced_patches_from_gitlab() {
+    local requested_tag="$1"
+    local resolved_tag tmp_dir archive_path source_dir plugin_dir artifact
+    local dest_dir="$PWD"
+    local android_sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+
+    resolved_tag=$(get_revanced_gitlab_tag "$requested_tag") || resolved_tag=""
+    if [[ -z "$resolved_tag" ]]; then
+        red_log "[-] Failed to resolve revanced-patches tag from GitLab"
+        return 1
+    fi
+
+    tmp_dir=$(mktemp -d)
+    archive_path="$tmp_dir/revanced-patches.tar.gz"
+    source_dir="$tmp_dir/revanced-patches-$resolved_tag"
+    plugin_dir="$tmp_dir/revanced-patches-gradle-plugin"
+
+    local gradle_user="${GITHUB_ACTOR:-}"
+    local gradle_pass="${GITHUB_TOKEN:-}"
+    if [[ -z "$gradle_user" ]] && command -v gh >/dev/null 2>&1; then
+        gradle_user=$(gh api user --jq '.login' 2>/dev/null || true)
+    fi
+    if [[ -z "$gradle_pass" ]] && command -v gh >/dev/null 2>&1; then
+        gradle_pass=$(gh auth token 2>/dev/null || true)
+    fi
+
+    if [[ -z "$android_sdk" ]]; then
+        for candidate in "$HOME/Android/Sdk" "$HOME/android-sdk" "/usr/local/lib/android/sdk" "/usr/lib/android-sdk" "/opt/android/sdk"; do
+            if [[ -d "$candidate/platform-tools" || -d "$candidate/build-tools" ]]; then
+                android_sdk="$candidate"
+                break
+            fi
+        done
+    fi
+
+    green_log "[+] Building revanced-patches $resolved_tag from GitLab mirror"
+    if ! wget -q -O "$archive_path" "https://gitlab.com/ReVanced/revanced-patches/-/archive/$resolved_tag/revanced-patches-$resolved_tag.tar.gz"; then
+        red_log "[-] Failed to download revanced-patches source archive for $resolved_tag"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    if ! tar -xzf "$archive_path" -C "$tmp_dir"; then
+        red_log "[-] Failed to extract revanced-patches source archive for $resolved_tag"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    if ! git clone --depth 1 https://github.com/ReVanced/revanced-patches-gradle-plugin.git "$plugin_dir" >/dev/null 2>&1; then
+        red_log "[-] Failed to download revanced-patches Gradle plugin source"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    python3 - <<PY >/dev/null
+from pathlib import Path
+settings = Path(r"$source_dir/settings.gradle.kts")
+text = settings.read_text()
+line = '    includeBuild("../revanced-patches-gradle-plugin")\n'
+if line not in text:
+    text = text.replace('pluginManagement {\n', 'pluginManagement {\n' + line, 1)
+settings.write_text(text)
+PY
+
+    if [[ -n "$android_sdk" ]]; then
+        printf 'sdk.dir=%s\n' "$android_sdk" > "$source_dir/local.properties"
+    fi
+
+    (
+        cd "$source_dir" || exit 1
+        ORG_GRADLE_PROJECT_githubPackagesUsername="$gradle_user" \
+        ORG_GRADLE_PROJECT_githubPackagesPassword="$gradle_pass" \
+        ./gradlew --no-daemon :patches:buildAndroid clean
+    ) || {
+        red_log "[-] Failed to build revanced-patches $resolved_tag from GitLab mirror"
+        rm -rf "$tmp_dir"
+        return 1
+    }
+
+    artifact=$(find "$source_dir/patches/build/libs" -maxdepth 1 -type f -name 'patches-*.rvp' | head -n1)
+    if [[ -z "$artifact" ]]; then
+        red_log "[-] revanced-patches build succeeded but no .rvp artifact was found"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    cp -f "$artifact" "$dest_dir/"
+    green_log "[+] Downloading $(basename "$artifact") from revanced (GitLab mirror build)"
+    rm -rf "$tmp_dir"
+}
+
 dl_gh() {
-  if [ $3 == "prerelease" ]; then
+  if [ "$3" == "prerelease" ]; then
     local repo=$1
     for repo in $1 ; do
-      local owner=$2 tag=$3 found=0 assets=0
-      releases=$(wget -qO- "https://api.github.com/repos/$owner/$repo/releases")
+      local owner=$2 tag=$3 found=0 assets=0 downloaded=0
+      releases=$(wget -qO- "https://api.github.com/repos/$owner/$repo/releases" 2>/dev/null || true)
       while read -r line; do
         if [[ $line == *"\"tag_name\":"* ]]; then
           tag_name=$(echo $line | cut -d '"' -f 4)
@@ -65,6 +171,7 @@ dl_gh() {
               name=$(basename "$url")
               wget -q -O "$name" "$url"
               green_log "[+] Downloading $name from $owner"
+              downloaded=1
             fi
           fi
         fi
@@ -75,21 +182,31 @@ dl_gh() {
           fi
         fi
       done <<< "$releases"
+      if [[ "$owner" == "revanced" && "$repo" == "revanced-patches" && $downloaded -eq 0 ]]; then
+        build_revanced_patches_from_gitlab "$tag" || return 1
+      fi
     done
   else
     for repo in $1 ; do
+      local downloaded=0
       tags=$( [ "$3" == "latest" ] && echo "latest" || echo "tags/$3" )
-      wget -qO- "https://api.github.com/repos/$2/$repo/releases/$tags" \
-        | jq -r '.assets[] | "\(.browser_download_url) \(.name)"' \
-        | while read -r url names; do
-          if [[ $url != *.asc ]]; then
-            if [[ "$3" == "latest" && "$names" == *dev* ]]; then
-              continue
-            fi
-            green_log "[+] Downloading $names from $2"
-            wget -q -O "$names" $url
+      while read -r url names; do
+        if [[ -z "$url" || -z "$names" ]]; then
+          continue
+        fi
+        if [[ $url != *.asc ]]; then
+          if [[ "$3" == "latest" && "$names" == *dev* ]]; then
+            continue
           fi
-        done
+          green_log "[+] Downloading $names from $2"
+          wget -q -O "$names" $url
+          downloaded=1
+        fi
+      done < <(wget -qO- "https://api.github.com/repos/$2/$repo/releases/$tags" 2>/dev/null | jq -r '.assets[]? | "\(.browser_download_url) \(.name)"')
+
+      if [[ "$2" == "revanced" && "$repo" == "revanced-patches" && $downloaded -eq 0 ]]; then
+        build_revanced_patches_from_gitlab "$3" || return 1
+      fi
     done
   fi
 }
