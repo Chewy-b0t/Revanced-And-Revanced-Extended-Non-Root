@@ -1,4 +1,5 @@
 name: Preparing to patch
+description: Set up Java for APK patching workflows.
 runs:
   using: "composite"
   steps:

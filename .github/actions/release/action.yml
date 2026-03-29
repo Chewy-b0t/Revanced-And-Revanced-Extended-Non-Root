@@ -1,4 +1,5 @@
 name: Releasing APK files
+description: Generate release notes and publish patched APK artifacts.
 runs:
   using: "composite"
   steps:
