@@ -45,6 +45,45 @@ get_revanced_gitlab_tag() {
     fi
 }
 
+customize_revanced_gitlab_source() {
+    local source_dir="$1"
+
+    python3 - <<PY
+from pathlib import Path
+
+check_java = Path(r"$source_dir/extensions/shared/library/src/main/java/app/revanced/extension/shared/checks/Check.java")
+text = check_java.read_text()
+old_should_run = """    static boolean shouldRun() {\n        return BaseSettings.CHECK_ENVIRONMENT_WARNINGS_ISSUED.get()\n                < NUMBER_OF_TIMES_TO_IGNORE_WARNING_BEFORE_DISABLING;\n    }\n"""
+new_should_run = """    static boolean shouldRun() {\n        return false;\n    }\n"""
+if old_should_run not in text:
+    raise SystemExit("expected Check.shouldRun block not found")
+check_java.write_text(text.replace(old_should_run, new_should_run, 1))
+
+env_java = Path(r"$source_dir/extensions/shared/library/src/main/java/app/revanced/extension/shared/checks/CheckEnvironmentPatch.java")
+text = env_java.read_text()
+if "import java.io.File;\n" not in text:
+    marker = "import java.nio.charset.StandardCharsets;\n"
+    if marker not in text:
+        raise SystemExit("expected import marker not found in CheckEnvironmentPatch.java")
+    text = text.replace(marker, marker + "import java.io.File;\n", 1)
+
+old_check_method = """    public static void check(Activity context) {\n        // If the warning was already issued twice, or if the check was successful in the past,\n        // do not run the checks again.\n"""
+new_check_method = """    public static void check(Activity context) {\n        suppressYouTubeReminderPreferences(context);\n\n        // If the warning was already issued twice, or if the check was successful in the past,\n        // do not run the checks again.\n"""
+if old_check_method not in text:
+    raise SystemExit("expected CheckEnvironmentPatch.check method header not found")
+text = text.replace(old_check_method, new_check_method, 1)
+
+helper_anchor = "    private static boolean buildFieldEqualsHash(String buildFieldName, String buildFieldValue, @Nullable String hash) {"
+helper_code = """    private static void suppressYouTubeReminderPreferences(Activity context) {\n        if (context == null) {\n            return;\n        }\n\n        try {\n            File sharedPrefsDir = new File(context.getApplicationInfo().dataDir, \"shared_prefs\");\n            File[] sharedPrefsFiles = sharedPrefsDir.listFiles((dir, name) -> name.endsWith(\".xml\"));\n            if (sharedPrefsFiles == null) {\n                return;\n            }\n\n            for (File sharedPrefsFile : sharedPrefsFiles) {\n                String fileName = sharedPrefsFile.getName();\n                String prefsName = fileName.substring(0, fileName.length() - 4);\n                android.content.SharedPreferences prefs = context.getSharedPreferences(prefsName, Context.MODE_PRIVATE);\n                Map<String, ?> entries = prefs.getAll();\n                if (entries == null || entries.isEmpty()) {\n                    continue;\n                }\n\n                android.content.SharedPreferences.Editor editor = prefs.edit();\n                boolean changed = false;\n\n                for (Map.Entry<String, ?> entry : entries.entrySet()) {\n                    String key = entry.getKey();\n                    if (key == null) {\n                        continue;\n                    }\n\n                    Object value = entry.getValue();\n                    if (isReminderBooleanKey(key) && value instanceof Boolean) {\n                        if (((Boolean) value).booleanValue()) {\n                            editor.putBoolean(key, false);\n                            changed = true;\n                        }\n                    } else if (isReminderIntegerKey(key) && value instanceof Integer) {\n                        if (((Integer) value).intValue() != 0) {\n                            editor.putInt(key, 0);\n                            changed = true;\n                        }\n                    }\n                }\n\n                if (changed) {\n                    editor.apply();\n                    Logger.printInfo(() -> \"Disabled YouTube reminder preferences in \" + prefsName);\n                }\n            }\n        } catch (Exception ex) {\n            Logger.printException(() -> \"Failed to suppress YouTube reminder preferences\", ex);\n        }\n    }\n\n    private static boolean isReminderBooleanKey(String key) {\n        return key.equals(\"bedtime_reminder_toggle\")\n                || key.endsWith(\":bedtime_reminder_toggle\")\n                || key.endsWith(\"bollard_enabled\");\n    }\n\n    private static boolean isReminderIntegerKey(String key) {\n        return key.endsWith(\"bollard_frequency_mins\");\n    }\n\n"""
+if helper_anchor not in text:
+    raise SystemExit("expected helper anchor not found in CheckEnvironmentPatch.java")
+if "private static void suppressYouTubeReminderPreferences(Activity context)" not in text:
+    text = text.replace(helper_anchor, helper_code + helper_anchor, 1)
+
+env_java.write_text(text)
+PY
+}
+
 build_revanced_patches_from_gitlab() {
     local requested_tag="$1"
     local resolved_tag tmp_dir archive_path source_dir plugin_dir artifact
@@ -108,6 +147,12 @@ if line not in text:
     text = text.replace('pluginManagement {\n', 'pluginManagement {\n' + line, 1)
 settings.write_text(text)
 PY
+
+    customize_revanced_gitlab_source "$source_dir" || {
+        red_log "[-] Failed to customize revanced-patches source"
+        rm -rf "$tmp_dir"
+        return 1
+    }
 
     if [[ -n "$android_sdk" ]]; then
         printf 'sdk.dir=%s\n' "$android_sdk" > "$source_dir/local.properties"
