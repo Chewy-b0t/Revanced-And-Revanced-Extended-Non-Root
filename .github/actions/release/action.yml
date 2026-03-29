@@ -3,12 +3,45 @@ description: Generate release notes and publish patched APK artifacts.
 runs:
   using: "composite"
   steps:
+    - name: Compute release metadata
+      id: meta
+      shell: bash
+      run: |
+        release_channel="${org_event_input:-$org_input}"
+        if [ -z "$release_channel" ]; then
+          release_channel="${GITHUB_WORKFLOW:-Manual Patch}"
+        fi
+
+        release_slug="$(printf '%s' "$release_channel" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')"
+        if [ -z "$release_slug" ]; then
+          release_slug="manual-patch"
+        fi
+
+        immutable_tag="${release_slug}-run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+        immutable_name="${release_channel} • Run ${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
+
+        {
+          echo "release_channel=$release_channel"
+          echo "release_slug=$release_slug"
+          echo "immutable_tag=$immutable_tag"
+          echo "immutable_name=$immutable_name"
+        } >> "$GITHUB_OUTPUT"
+
     - name: Generate release info
       shell: bash
       run: |
         echo "
-        **This repository is not like any other repository. It does not create new releases; it only releases new files.**
-        **Forget about scrolling whole release page find files. Just read [Readme.md](../main/README.md#microg-revanced) file and select apps you want download.**
+        **Obtainium-friendly release for:** ${{ steps.meta.outputs.release_channel }}
+        **Immutable tag:** \`${{ steps.meta.outputs.immutable_tag }}\`
+        **Workflow run:** https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        
+        **This fork now publishes two release styles:**
+        - **Normal immutable releases** for Obtainium and other update trackers
+        - **The legacy \`all\` release** so the README direct-download links keep working
+        
+        **If you are browsing manually, read [README.md](../main/README.md#microg-revanced) and pick the APK that matches your CPU architecture.**
+        **If you are using Obtainium, point it at this repository and optionally add an APK filter regex for the exact file you want.**
+        
         **Change log** :point_down:
         [Morphe](https://github.com/MorpheApp/morphe-patches/releases/)
         [Revanced](https://github.com/revanced/revanced-patches/releases)
@@ -17,12 +50,21 @@ runs:
         [Revanced Extended for Android 6 & 7](https://github.com/kitadai31/revanced-patches-android6-7/releases)
         [Revanced Extended For Android 5:](https://github.com/d4n3436/revanced-patches-android5/releases)
         "> ${{ github.workspace }}-CHANGELOG.txt
-    - name: Release
+    - name: Release for Obtainium
       uses: ncipollo/release-action@v1.21.0
       with:
         artifacts: |
           ./release/*.apk
-        name: Revanced & Revanced Extended
+        name: ${{ steps.meta.outputs.immutable_name }}
+        tag: ${{ steps.meta.outputs.immutable_tag }}
+        bodyFile: ${{ github.workspace }}-CHANGELOG.txt
+        allowUpdates: true
+    - name: Update legacy all release
+      uses: ncipollo/release-action@v1.21.0
+      with:
+        artifacts: |
+          ./release/*.apk
+        name: Revanced & Revanced Extended (legacy all tag)
         tag: all
         bodyFile: ${{ github.workspace }}-CHANGELOG.txt
         allowUpdates: true
