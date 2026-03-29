@@ -117,7 +117,7 @@ PY
         cd "$source_dir" || exit 1
         ORG_GRADLE_PROJECT_githubPackagesUsername="$gradle_user" \
         ORG_GRADLE_PROJECT_githubPackagesPassword="$gradle_pass" \
-        ./gradlew --no-daemon :patches:buildAndroid clean
+        ./gradlew --no-daemon clean :patches:buildAndroid
     ) || {
         red_log "[-] Failed to build revanced-patches $resolved_tag from GitLab mirror"
         rm -rf "$tmp_dir"
@@ -543,7 +543,10 @@ patch() {
 			unset CI GITHUB_ACTION GITHUB_ACTIONS GITHUB_ACTOR GITHUB_ENV GITHUB_EVENT_NAME GITHUB_EVENT_PATH GITHUB_HEAD_REF GITHUB_JOB GITHUB_REF GITHUB_REPOSITORY GITHUB_RUN_ID GITHUB_RUN_NUMBER GITHUB_SHA GITHUB_WORKFLOW GITHUB_WORKSPACE RUN_ID RUN_NUMBER
 		fi
 		echo "java -jar *cli*.jar $p$b $m$opt --out=./release/$1-$2.apk$excludePatches$includePatches$ks $pu$force $a./download/$1.apk"
-		eval java -jar *cli*.jar $p$b $m$opt --out=./release/$1-$2.apk$excludePatches$includePatches$ks $pu$force $a./download/$1.apk
+		eval java -jar *cli*.jar $p$b $m$opt --out=./release/$1-$2.apk$excludePatches$includePatches$ks $pu$force $a./download/$1.apk || {
+			red_log "[-] Failed to patch $1"
+			exit 1
+		}
   		unset version
 		unset lock_version
 		unset excludePatches
