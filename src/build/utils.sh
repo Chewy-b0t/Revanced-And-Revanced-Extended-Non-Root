@@ -1,16 +1,20 @@
 #!/bin/bash
 
-mkdir ./release ./download
+mkdir -p ./release ./download
 
 #Setup pup for download apk files
-wget -q -O ./pup.zip https://github.com/ericchiang/pup/releases/download/v0.4.0/pup_v0.4.0_linux_amd64.zip
-unzip "./pup.zip" -d "./" > /dev/null 2>&1
+if [ ! -x "./pup" ]; then
+    wget -q -O ./pup.zip https://github.com/ericchiang/pup/releases/download/v0.4.0/pup_v0.4.0_linux_amd64.zip
+    unzip -oq "./pup.zip" -d "./" > /dev/null 2>&1
+fi
 pup="./pup"
 #Setup APKEditor for install combine split apks
-wget -q -O ./APKEditor.jar https://github.com/REAndroid/APKEditor/releases/download/V1.4.7/APKEditor-1.4.7.jar
+if [ ! -s "./APKEditor.jar" ]; then
+    wget -q -O ./APKEditor.jar https://github.com/REAndroid/APKEditor/releases/download/V1.4.7/APKEditor-1.4.7.jar
+fi
 APKEditor="./APKEditor.jar"
 #Find lastest user_agent
-user_agent=$(wget -qO- https://www.whatismybrowser.com/guides/the-latest-user-agent/firefox | tr '\n' ' ' | sed 's#</tr>#\n#g' | grep 'Firefox (Standard)' | sed -n 's/.*<span class="code">\([^<]*Android[^<]*\)<\/span>.*/\1/p') \
+user_agent=$(wget -T 15 -qO- https://www.whatismybrowser.com/guides/the-latest-user-agent/firefox | tr '\n' ' ' | sed 's#</tr>#\n#g' | grep 'Firefox (Standard)' | sed -n 's/.*<span class="code">\([^<]*Android[^<]*\)<\/span>.*/\1/p') \
 || user_agent=
 [ -z "$user_agent" ] && {
   user_agent='Mozilla/5.0 (Android 16; Mobile; rv:146.0) Gecko/146.0 Firefox/146.0'
@@ -25,6 +29,122 @@ green_log() {
 }
 red_log() {
     echo -e "\e[31m$1\e[0m"
+}
+
+#################################################
+
+custom_fix_keystore="./src/custom-fixes.keystore"
+custom_fix_alias="custom-fixes"
+custom_fix_password="${CUSTOM_FIX_KEYSTORE_PASSWORD:-changeit}"
+
+resolve_android_tool() {
+    local tool_name="$1"
+    local candidate
+    local -a candidates=(
+        "${ANDROID_BUILD_TOOLS_DIR}/${tool_name}"
+        "${ANDROID_HOME}/build-tools/34.0.0/${tool_name}"
+        "${ANDROID_SDK_ROOT}/build-tools/34.0.0/${tool_name}"
+        "$HOME/Android/Sdk/build-tools/34.0.0/${tool_name}"
+        "/usr/local/lib/android/sdk/build-tools/34.0.0/${tool_name}"
+    )
+
+    for candidate in "${candidates[@]}"; do
+        if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+
+    command -v "$tool_name" 2>/dev/null || true
+}
+
+apksigner_bin="$(resolve_android_tool apksigner)"
+zipalign_bin="$(resolve_android_tool zipalign)"
+
+ensure_custom_fix_keystore() {
+    if [ -f "$custom_fix_keystore" ]; then
+        return 0
+    fi
+
+    green_log "[+] Generating signing keystore for custom APK fixes"
+    keytool -genkeypair \
+        -storetype PKCS12 \
+        -keystore "$custom_fix_keystore" \
+        -storepass "$custom_fix_password" \
+        -keypass "$custom_fix_password" \
+        -alias "$custom_fix_alias" \
+        -keyalg RSA \
+        -keysize 4096 \
+        -sigalg SHA256withRSA \
+        -validity 36500 \
+        -dname "CN=Custom Fixes, OU=Codex, O=Local, L=Local, ST=Local, C=US" \
+        >/dev/null 2>&1
+}
+
+resign_apk() {
+    local apk="$1"
+
+    if [ ! -x "$apksigner_bin" ]; then
+        red_log "[-] apksigner not found at $apksigner_bin"
+        exit 1
+    fi
+
+    ensure_custom_fix_keystore
+
+    zip -dq "$apk" "META-INF/MANIFEST.MF" "META-INF/*.SF" "META-INF/*.RSA" "META-INF/*.DSA" >/dev/null 2>&1 || true
+
+    if [ -x "$zipalign_bin" ]; then
+        local aligned="${apk%.apk}-aligned.apk"
+        rm -f "$aligned"
+        "$zipalign_bin" -f -p 4 "$apk" "$aligned"
+        mv -f "$aligned" "$apk"
+    fi
+
+    "$apksigner_bin" sign \
+        --ks "$custom_fix_keystore" \
+        --ks-key-alias "$custom_fix_alias" \
+        --ks-pass "pass:$custom_fix_password" \
+        --key-pass "pass:$custom_fix_password" \
+        "$apk"
+}
+
+disable_youtube_watch_break() {
+    local apk="$1"
+    local deleted=0
+    local entry
+    local -a watch_break_entries=(
+        "assets/mainapp_filegroup/_srs_resources_eml_bundle/watch_break_bottom_sheet_controller_ae1c37de520109e7"
+        "assets/mainapp_filegroup/_srs_resources_eml_bundle/watch_break_reminder.eml-js_e8532bbd12df7300"
+        "assets/mainapp_filegroup/_srs_resources_eml_bundle/watch_break_reminder_controller_module_b8b58846d7ecc800"
+        "assets/mainapp_filegroup/_srs_resources_eml_bundle/watch_break_reminder_footer.eml-js_65e70bc0cd7b0779"
+        "assets/mainapp_filegroup/_srs_resources_eml_bundle/watch_break_reminder_footer_controller_8b074ad6f20d22da"
+        "assets/mainapp_filegroup/_srs_resources_eml_bundle/watch_break_settings_bottom_sheet.eml-js_8bb9574c6f3e202d"
+    )
+
+    green_log "[+] Removing YouTube watch break assets from $(basename "$apk")"
+    for entry in "${watch_break_entries[@]}"; do
+        if unzip -l "$apk" "$entry" >/dev/null 2>&1; then
+            zip -dq "$apk" "$entry" >/dev/null 2>&1
+            deleted=1
+        fi
+    done
+
+    if [ "$deleted" -eq 1 ]; then
+        resign_apk "$apk"
+    else
+        red_log "[-] No watch break assets were found in $(basename "$apk")"
+    fi
+}
+
+postprocess_patched_apk() {
+    local apk="$1"
+    local app="$2"
+
+    case "$app" in
+        youtube|youtube-arm64-v8a|youtube-armeabi-v7a|youtube-x86|youtube-x86_64)
+            disable_youtube_watch_break "$apk"
+            ;;
+    esac
 }
 
 #################################################
@@ -592,6 +712,7 @@ patch() {
 			red_log "[-] Failed to patch $1"
 			exit 1
 		}
+		postprocess_patched_apk "./release/$1-$2.apk" "$1"
   		unset version
 		unset lock_version
 		unset excludePatches
